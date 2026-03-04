@@ -1,145 +1,166 @@
-# Basic Decoder Transformer Language Model
+# Language Model Training & Generation
 
-This repository presents a **from-scratch implementation of a GPT-style decoder-only Transformer** using PyTorch. The project is intended for **educational and research-oriented purposes**, focusing on architectural correctness, training mechanics, and clarity of implementation rather than output quality.
-
----
-
-## Abstract
-
-We implement a character-level autoregressive language model based on the Transformer decoder architecture. The model employs causal self-attention, residual connections, and layer normalization, trained using maximum likelihood estimation to predict the next token given a context window. This implementation serves as a minimal and transparent reference for understanding GPT-style models.
-
----
+A from-scratch implementation of a Transformer decoder-based language model using PyTorch. This project includes model architecture, training script, and text generation.
 
 ## Model Architecture
 
-The architecture follows the standard decoder-only Transformer design:
+The model follows standard decoder-only Transformer design:
 
-- Token Embedding Layer
-- Positional Embedding Layer
-- Stack of Transformer Blocks, each containing:
-  - Multi-Head Causal Self-Attention
+- **Token Embedding Layer** - Learnable token embeddings
+- **Positional Embedding Layer** - Sinusoidal position encodings
+- **Transformer Decoder Blocks** - Each containing:
+  - Multi-Head Causal Self-Attention (Flash Attention)
   - Feed-Forward Network
   - Residual Connections
   - Layer Normalization
-- Final Linear Projection to Vocabulary Space
+- **Output Layer** - Linear projection to vocabulary space
 
-The model operates at the character level, using a simple character-wise tokenization scheme. Each unique character in the dataset is mapped to an integer index, and the model is trained to autoregressively predict the next character given a fixed-length context window.
+### Key Features
 
-The implementation follows standard Transformer decoder principles, informed by the original [Transformer paper](https://arxiv.org/abs/1706.03762) (*Attention Is All You Need*, Vaswani et al., 2017), with additional guidance from [Andrej Karpathy's lecture](https://www.youtube.com/watch?v=kCc8FmEb1nY&list=PLAqhIrjkxbuWI23v9cThsA9GvCAUhRvKZ&index=8).
+- **Flash Attention** - Uses `F.scaled_dot_product_attention` for optimized attention computation
+- **Mixed Precision Training** - bfloat16 autocast for memory efficiency
+- **Gradient Clipping** - Prevents exploding gradients
+- **Weight Decay** - L2 regularization via AdamW
+- **Learning Rate Scheduling** - Cosine annealing
+- **Model Compilation** - `torch.compile` for faster execution
+- **TF32 MatMul Precision** - Optimized matrix multiplication on NVIDIA GPUs
+- **Gradient Accumulation** - Effective larger batch size
+- **Random Sampling** - Batches sampled randomly from dataset
+- **Checkpointing** - Periodic saves + best model tracking
 
----
-
-## Training Configuration
-
-### Hyperparameters
+### Default Hyperparameters
 
 | Parameter | Value |
 |-----------|-------|
-| Batch Size | 64 |
-| Context Length (Block Size) | 256 |
-| Embedding Dimension | 384 |
-| Number of Attention Heads | 6 |
-| Number of Transformer Layers | 6 |
-| Dropout | 0.2 |
+| Batch Size | 4 |
+| Sequence Length | 1024 |
+| Embedding Dimension | 768 |
+| Number of Attention Heads | 12 |
+| Number of Transformer Layers | 12 |
+| Dropout | 0.1 |
 | Learning Rate | 3.00 × 10⁻⁴ |
-| Optimizer | AdamW |
-| Learning Rate Scheduler | ReduceLROnPlateau |
+| Weight Decay | 0.1 |
 | Gradient Clipping | 1.0 |
-| Precision | Automatic Mixed Precision (AMP) |
-| Training Iterations | 5000 |
+| Effective Batch Size (tokens) | 524,288 |
+| Gradient Accumulation Steps | 128 |
+
+> Note: Adjust `batch_size` to fit your GPU memory; gradient accumulation steps will automatically adjust to maintain the effective batch size.
 
 ---
 
-## Hardware & Training Time
+## Training
 
-- **GPU:** NVIDIA RTX 4060
-- **Total Training Time:** 22.43 minutes
+### Training Configuration
 
-### Final Metrics
+- **Optimizer:** AdamW with betas=(0.9, 0.95), eps=1e-8
+- **Precision:** bfloat16 mixed precision
+- **Batching:** Random sampling from dataset
+- **Checkpointing:**
+  - Periodic checkpoints every N steps
+  - Best model saved based on training loss
+- **Logging:** CSV logging of all training metrics
+- **Total Training Time:** Printed at completion
 
-- **Training Loss:** 0.679883
-- **Validation Loss:** 1.134118
+### Sample Training Results
 
-These metrics are reported for completeness; performance optimization was not a primary objective.
+- **Training Steps:** 80
+- **Model Parameters:** 124.55 M
+- **Train Tokens:** 461,470
+- **Val Tokens:** 51,275
+- **Total Epochs (how many times the dataset is seen):** 90.89
+- **Final Training Loss:** 33.52
+- **Final Validation Loss:** 29.05
+- **Total Training Time:** 3.91 Hours
 
+Hardware: Trained on a single NVIDIA RTX 4060 GPU
+
+Plots
 ---
+<img src="gpt2/checkpoints/training_plots.png" width="800"/>
+
 
 ## Dataset
 
-The training data consists of a single text file composed of movie transcript excerpts from:
+The training data consists of 9 podcast transcripts:
+- Lex Friedman Podcast
+- Dwarkesh Patel
 
-- *Interstellar*
-- *Prisoners*
-- *The Revenant*
-- *Oppenheimer*
-- *Nightcrawler*
-- *Zodiac*
-- *Memento*
-- *Se7en*
-- *The Prestige*
+The dataset is tokenized using GPT-2 tokenizer (tiktoken).
 
-The dataset is intentionally simple and serves only to provide sequential text for learning character-level distributions.
+## Generation
 
----
+A standalone generation script is provided for text generation using trained models.
 
-## Sample Generation (Excerpt)
+### Usage
+
+```bash
+python gpt2/gpt2_generate.py
 ```
-Cooper, showly, something or many young sin.
+## Training Plots
 
-LOKI: Hey, have you, Dad.
+Run `python gpt2/gpt2_plot_training.py` to generate visualization of training metrics. The script loads `training_log.csv` and creates plots showing:
+- Training & validation loss
+- Learning rate schedule
 
-Let's go!
-
-Don't do open books!
-
-Get up!
-
-Get out!
-
-Who put I thought me on. It's…
-
-We believe you got that way we've never seen them.
-
-I've got some and kids for long gonna life them.
-```
-
-*Text quality is not emphasized; the sample demonstrates successful autoregressive generation.*
-
----
+Plots are saved to `gpt2/checkpoints/training_plots.png`.
 
 ## Repository Structure
+
 ```
 basic-lm/
-├── checkpoints/
-│   └── best_model.pt
-├── dataset.txt
-├── gpt.py
-├── gpt_train.py
-├── generate_sample.py
-├── generated_sample.txt
-├── training_metrics.txt
+├── gpt2/
+│   ├── checkpoints/
+│   │   ├── best_model.pt
+│   │   └── checkpoint_step_N.pt
+│   ├── dataset.txt
+│   ├── gpt2.py
+│   ├── gpt2_train.py
+│   ├── gpt2_generate.py
+│   ├── generated_sample.txt
+│   └── gpt2_plot_training.py
 ├── README.md
-├── LICENSE
-└── .gitignore
+└── LICENSE
 ```
 
----
+## Quick Start
 
-## Scope and Limitations
+### Train Model
+```bash
+python gpt2/gpt2_train.py
+```
 
-This project prioritizes:
+### Generate Text
+```bash
+python gpt2/gpt2_generate.py
+```
 
-- Conceptual correctness
-- Training loop transparency
-- Architectural clarity
+## Generated Sample
 
-It does **not** aim to:
+```
+,. the- that to of and like's a areand is they ifentious in then luxury Highland#$#$of there very for solves Turtle Broadcastingopez bass this allthat 219 an you Yeah we incyu Technology Iowa uh I think Lewis it'mME
+,. the- that to of and like's a areand is Kelvin theyI in then if Highland territ#$#$'re very forentious there solves Broadcasting luxuryopez bassof this an you Turtle wethat Bristol Yeah Iowayu 219 I think it
+```
 
-- Compete with large-scale pretrained models
-- Optimize generation quality
-- Use large or curated datasets
+> Note: This project is a from-scratch implementation built to demonstrate the core ideas and architecture of a decoder-only Transformer language model, not to achieve state-of-the-art generation quality.
 
----
+## References
+
+### Key Papers
+
+- [Language Models are Unsupervised Multitask Learners](https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf) - Radford et al., 2019 (GPT-2)
+- [Language Models are Few-Shot Learners](https://arxiv.org/abs/2005.14165) - Brown et al., 2020 (GPT-3)
+- [Attention Is All You Need](https://arxiv.org/abs/1706.03762) - Vaswani et al., 2017
+
+- With additional guidance from [Andrej Karpathy's lectures](https://www.youtube.com/watch?v=l8pRSuU81PU&list=PLAqhIrjkxbuWI23v9cThsA9GvCAUhRvKZ&index=10)
+
+## Roadmap
+
+Planning to extend this project with more advanced modern architectures, including:
+
+- **Gemma 3** — Google DeepMind's open model series
+- **Qwen** — Alibaba's open-weight LLM family
+
+The goal is to implement and compare these architectures from scratch alongside the existing GPT-2 baseline.
 
 ## License
 
