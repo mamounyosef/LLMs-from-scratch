@@ -1,6 +1,7 @@
 import torch
 torch.set_float32_matmul_precision('high')
 from torch.utils.data import Dataset, DataLoader
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 import tiktoken
 import os
 import time
@@ -8,23 +9,44 @@ import csv
 
 from gpt2 import GPT
 
+SEED = 42
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # hyperparameters and configs
-num_iters=80
-effective_batch_size_in_tokens = 524288 #2**19, ~0.5M number of tokens, which is 524288 // T samples
-batch_size = 4
-seq_len = 1024
-gradient_accumulation_steps = effective_batch_size_in_tokens // (batch_size * seq_len)
-learning_rate = 3e-4
 
-eval_interval = 1 #
-eval_steps = 30 # number of validation steps to run
-checkpoint_interval = 10 # save checkpoint every N steps
+ARCHITECTURE_CONFIG = {
+    'n_layers': 12,
+    'embedding_dim': 768,
+    'max_seq_len': 1024, # (context window size e)
+    'num_heads': 12,
+    'vocab_size': 50432,
+    'dropout_rate': 0.1
+}
 
-print(f"Effective Total batch size in tokens: {effective_batch_size_in_tokens}, Batch Size (in steps): {batch_size}, Gradient Accumulation Steps: {gradient_accumulation_steps}")
+TRAIN_CONFIG = {
+    'num_iters': 80,
+    'effective_batch_size_in_tokens': 524288,  # 2**19, ~0.5M number of tokens, which is 524288 // T samples
+    'batch_size': 4,
+    'gradient_accumulation_steps': None,  # will be set dynamically
+    
+    'learning_rate': 3e-4,
+    'min_lr': None, # will be set dynamically
+    'lr_warmup_start_factor': 1e-8,
+    'warmup_steps': 2000,
 
-model = GPT().to(device) # default parameters
+    'eval_interval': 1,
+    'eval_steps': 30, # number of validation steps to run during evaluation
+    'checkpoint_interval': 10
+}
+TRAIN_CONFIG['gradient_accumulation_steps'] = TRAIN_CONFIG['effective_batch_size_in_tokens'] // (TRAIN_CONFIG['batch_size'] * ARCHITECTURE_CONFIG['max_seq_len'])
+TRAIN_CONFIG["min_lr"] = TRAIN_CONFIG['learning_rate'] * 0.1
+
+print(f"Effective Total batch size in tokens: {TRAIN_CONFIG['effective_batch_size_in_tokens']}, Batch Size (in steps): {TRAIN_CONFIG['batch_size']}, Gradient Accumulation Steps: {TRAIN_CONFIG['gradient_accumulation_steps']}")
+
+model = GPT(n_layers=ARCHITECTURE_CONFIG['n_layers'], embedding_dim=ARCHITECTURE_CONFIG['embedding_dim'], num_heads=ARCHITECTURE_CONFIG['num_heads'], max_seq_len=ARCHITECTURE_CONFIG['max_seq_len'], vocab_size=ARCHITECTURE_CONFIG['vocab_size'], dropout_rate=ARCHITECTURE_CONFIG['dropout_rate']).to(device)
 model = torch.compile(model)
 print(sum(p.numel() for p in model.parameters())/1e6, 'M parameters')
     
@@ -60,12 +82,12 @@ class DataLoaderLite:
         return x, y
     
 
-train_loader = DataLoaderLite(batch_size=batch_size, split='train')
-val_loader = DataLoaderLite(batch_size=batch_size, split='val')
+train_loader = DataLoaderLite(batch_size=TRAIN_CONFIG['batch_size'], seq_len=ARCHITECTURE_CONFIG['max_seq_len'], split='train')
+val_loader = DataLoaderLite(batch_size=TRAIN_CONFIG['batch_size'], seq_len=ARCHITECTURE_CONFIG['max_seq_len'], split='val')
 
 print(f"Train number of tokens: {len(train_loader.data)}, Val number of tokens: {len(val_loader.data)}")
 num_tokens_in_dataset = len(train_loader.data)
-num_epochs = (num_iters * effective_batch_size_in_tokens) / num_tokens_in_dataset
+num_epochs = (TRAIN_CONFIG['num_iters'] * TRAIN_CONFIG['effective_batch_size_in_tokens']) / num_tokens_in_dataset
 print(f"Total Epochs (how many times the dataset is seen): {num_epochs:.2f}")
     
 save_dir = r"gpt2\checkpoints"
@@ -78,8 +100,25 @@ with open(log_file, 'w', newline='') as f:
     writer = csv.writer(f)
     writer.writerow(csv_header)
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, T_max=num_iters, eta_min=learning_rate*0.1)
+optimizer = torch.optim.AdamW(model.parameters(), lr=TRAIN_CONFIG['learning_rate'], betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, T_max=TRAIN_CONFIG['num_iters'], eta_min=TRAIN_CONFIG['learning_rate']*0.1)
+
+warmup_scheduler = LinearLR(
+    optimizer,
+    start_factor=TRAIN_CONFIG['lr_warmup_start_factor'],
+    end_factor=1.0,
+    total_iters=TRAIN_CONFIG['warmup_steps'],
+)
+cosine_scheduler = CosineAnnealingLR(
+    optimizer,
+    T_max=TRAIN_CONFIG['num_iters'] - TRAIN_CONFIG['warmup_steps'],
+    eta_min=TRAIN_CONFIG['min_lr'],
+)
+scheduler = SequentialLR(
+    optimizer,
+    schedulers=[warmup_scheduler, cosine_scheduler],
+    milestones=[TRAIN_CONFIG['warmup_steps']],
+)
 
 best_loss = float('inf')
 
@@ -88,21 +127,21 @@ total_starting_time = time.time()
 print("Starting training...")
 print("*" * 80)
 
-for iter in range(num_iters):
+for iter in range(TRAIN_CONFIG['num_iters']):
 
     optimizer.zero_grad()
     loss_accum = 0.0
 
     # Actual training
     model.train()
-    for micro_step in range(gradient_accumulation_steps):
+    for micro_step in range(TRAIN_CONFIG['gradient_accumulation_steps']):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
 
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             logits, loss = model(x, y)
 
-        loss = loss / gradient_accumulation_steps
+        loss = loss / TRAIN_CONFIG['gradient_accumulation_steps']
         loss_accum += loss.detach()
         loss.backward()
 
@@ -115,27 +154,27 @@ for iter in range(num_iters):
     dt = t1 - t0
     t0 = t1
 
-    tokens_processed = effective_batch_size_in_tokens
+    tokens_processed = TRAIN_CONFIG['effective_batch_size_in_tokens']
     tokens_per_sec = tokens_processed / dt
     current_lr = scheduler.get_last_lr()[0]
 
     # validation
     val_loss = 0.0
-    if iter % eval_interval == 0 or iter == num_iters - 1:
+    if iter % TRAIN_CONFIG['eval_interval'] == 0 or iter == TRAIN_CONFIG['num_iters'] - 1:
         model.eval()
         val_loss_accum = 0.0
         with torch.no_grad():
-            for _ in range(eval_steps):
+            for _ in range(TRAIN_CONFIG['eval_steps']):
                 x, y = val_loader.next_batch()
                 x, y = x.to(device), y.to(device)
                 with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                     logits, loss = model(x, y)
                 val_loss_accum += loss.detach()
-        val_loss = val_loss_accum / eval_steps
+        val_loss = val_loss_accum / TRAIN_CONFIG['eval_steps']
         model.train()
 
     # checkpointing
-    if iter >= int(num_iters * 0.5) and iter % checkpoint_interval == 0:
+    if iter >= int(TRAIN_CONFIG['num_iters'] * 0.5) and iter % TRAIN_CONFIG['checkpoint_interval'] == 0:
         checkpoint_path = os.path.join(save_dir, f"checkpoint_step_{iter}.pt")
         torch.save({
             'iter': iter,

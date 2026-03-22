@@ -27,9 +27,8 @@ class Head(nn.Module):
         q = self.query(x) # (B, seq_len, head_size)
         v = self.value(x) # (B, seq_len, head_size)
 
-        # Flash Attention with causal mask
         attn_mask = torch.tril(torch.ones(seq_len, seq_len, device=x.device)).bool()
-        out = F.scaled_dot_product_attention(
+        out = F.scaled_dot_product_attention( # Flash Attention
             q, k, v,
             attn_mask=attn_mask,
             dropout_p=self.dropout.p if self.training else 0.0,
