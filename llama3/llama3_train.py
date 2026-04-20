@@ -1,13 +1,13 @@
 import torch
 torch.set_float32_matmul_precision('high')
 from torch.utils.data import Dataset, DataLoader
-from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 import tiktoken
 import os
 import time
 import csv
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 
-from gpt2 import GPT
+from llama3 import llama
 
 SEED = 42
 torch.manual_seed(SEED)
@@ -16,37 +16,39 @@ torch.cuda.manual_seed_all(SEED)
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # hyperparameters and configs
-
 ARCHITECTURE_CONFIG = {
-    'n_layers': 12,
-    'embedding_dim': 768,
-    'max_seq_len': 1024, # (context window size e)
-    'num_heads': 12,
-    'vocab_size': 50432,
+    'n_layers': 32,
+    'embedding_dim': 4096,
+    'hidden_dim': 14_336,
+    'num_heads': 32,
+    'grouped_kv_heads': 8,
+    'max_seq_len': 1024, # (context window size)
+    'vocab_size': 128_000,
+    'rope_theta': 500_000,
     'dropout_rate': 0.1
 }
-
 TRAIN_CONFIG = {
     'num_iters': 80,
     'effective_batch_size_in_tokens': 524288,  # 2**19, ~0.5M number of tokens, which is 524288 // T samples
     'batch_size': 4,
     'gradient_accumulation_steps': None,  # will be set dynamically
-    
+
     'learning_rate': 3e-4,
     'min_lr': None, # will be set dynamically
-    'lr_warmup_start_factor': 1e-8,
     'warmup_steps': 2000,
 
     'eval_interval': 1,
     'eval_steps': 30, # number of validation steps to run during evaluation
     'checkpoint_interval': 10
+
 }
-TRAIN_CONFIG['gradient_accumulation_steps'] = TRAIN_CONFIG['effective_batch_size_in_tokens'] // (TRAIN_CONFIG['batch_size'] * ARCHITECTURE_CONFIG['max_seq_len'])
+TRAIN_CONFIG['gradient_accumulation_steps'] = TRAIN_CONFIG['effective_batch_size_in_tokens'] // (TRAIN_CONFIG['batch_size'] * ARCHITECTURE_CONFIG['seq_len'])
 TRAIN_CONFIG["min_lr"] = TRAIN_CONFIG['learning_rate'] * 0.1
+
 
 print(f"Effective Total batch size in tokens: {TRAIN_CONFIG['effective_batch_size_in_tokens']}, Batch Size (in steps): {TRAIN_CONFIG['batch_size']}, Gradient Accumulation Steps: {TRAIN_CONFIG['gradient_accumulation_steps']}")
 
-model = GPT(n_layers=ARCHITECTURE_CONFIG['n_layers'], embedding_dim=ARCHITECTURE_CONFIG['embedding_dim'], num_heads=ARCHITECTURE_CONFIG['num_heads'], max_seq_len=ARCHITECTURE_CONFIG['max_seq_len'], vocab_size=ARCHITECTURE_CONFIG['vocab_size'], dropout_rate=ARCHITECTURE_CONFIG['dropout_rate']).to(device)
+model = llama().to(device) # default parameters
 model = torch.compile(model)
 print(sum(p.numel() for p in model.parameters())/1e6, 'M parameters')
     
@@ -58,7 +60,7 @@ class DataLoaderLite:
         with open(dataset_path, 'r', encoding='utf-8') as f:
             text = f.read()
         
-        enc = tiktoken.get_encoding('gpt2')
+        enc = tiktoken.get_encoding('')
         tokens = enc.encode(text)
         self.data = torch.tensor(tokens, dtype=torch.long)
 
@@ -82,15 +84,15 @@ class DataLoaderLite:
         return x, y
     
 
-train_loader = DataLoaderLite(batch_size=TRAIN_CONFIG['batch_size'], seq_len=ARCHITECTURE_CONFIG['max_seq_len'], split='train')
-val_loader = DataLoaderLite(batch_size=TRAIN_CONFIG['batch_size'], seq_len=ARCHITECTURE_CONFIG['max_seq_len'], split='val')
+train_loader = DataLoaderLite(batch_size=batch_size, split='train')
+val_loader = DataLoaderLite(batch_size=batch_size, split='val')
 
 print(f"Train number of tokens: {len(train_loader.data)}, Val number of tokens: {len(val_loader.data)}")
 num_tokens_in_dataset = len(train_loader.data)
 num_epochs = (TRAIN_CONFIG['num_iters'] * TRAIN_CONFIG['effective_batch_size_in_tokens']) / num_tokens_in_dataset
 print(f"Total Epochs (how many times the dataset is seen): {num_epochs:.2f}")
     
-save_dir = r"gpt2\checkpoints"
+save_dir = r"llama3\checkpoints"
 os.makedirs(save_dir, exist_ok=True)
 
 # csv logging
@@ -100,12 +102,11 @@ with open(log_file, 'w', newline='') as f:
     writer = csv.writer(f)
     writer.writerow(csv_header)
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=TRAIN_CONFIG['learning_rate'], betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, T_max=TRAIN_CONFIG['num_iters'], eta_min=TRAIN_CONFIG['learning_rate']*0.1)
+optimizer = torch.optim.AdamW(model.parameters(), lr=TRAIN_CONFIG['learning_rate'], betas=(0.9, 0.95), eps=1e-5, weight_decay=0.1)
 
 warmup_scheduler = LinearLR(
     optimizer,
-    start_factor=TRAIN_CONFIG['lr_warmup_start_factor'],
+    start_factor=1e-8,
     end_factor=1.0,
     total_iters=TRAIN_CONFIG['warmup_steps'],
 )
@@ -119,6 +120,10 @@ scheduler = SequentialLR(
     schedulers=[warmup_scheduler, cosine_scheduler],
     milestones=[TRAIN_CONFIG['warmup_steps']],
 )
+
+
+
+
 
 best_loss = float('inf')
 

@@ -208,3 +208,6 @@ __marimo__/
 checkpoints/best_model.pt
 .vscode/settings.json
 gpt2/checkpoints/best_model.pt
+test.ipynb
+test1.ipynb
+readme_notes
