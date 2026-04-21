@@ -28,15 +28,24 @@ class MultiHeadAttention(nn.Module):
 
         B, T, D = x.shape # x (input) of size (batch, seq_len, embedding_dim)
 
+        if not self.training:
+            x = x[:, -1, :] # (batch, 1, embedding_dim) during inference
+
         k_v, q = self.kqv(x).split([self.head_size * self.grouped_kv_heads * 2, self.embedding_dim], dim=-1) # split into k_v and q first
         k, v = k_v.split(self.head_size * self.grouped_kv_heads, dim=-1) # then split into k and v
 
-        k = k.view(B, T, self.grouped_kv_heads, self.head_size).transpose(1, 2) # finally its (B, grouped_kv_heads, seq_len, head_size)
-        q = q.view(B, T, self.num_heads, self.head_size).transpose(1, 2) # (B, num_heads, seq_len, head_size)
-        v = v.view(B, T, self.grouped_kv_heads, self.head_size).transpose(1, 2) # (B, grouped_kv_heads, seq_len, head_size)
+        second_dim = T if self.training else 1 # during inference the 2nd indexed dimention is 1 instead of seq_len for each k and q and v
+        k = k.view(B, second_dim, self.grouped_kv_heads, self.head_size).transpose(1, 2) # finally its (B, grouped_kv_heads, seq_len, head_size)
+        q = q.view(B, second_dim, self.num_heads, self.head_size).transpose(1, 2) # (B, num_heads, seq_len, head_size)
+        v = v.view(B, second_dim, self.grouped_kv_heads, self.head_size).transpose(1, 2) # (B, grouped_kv_heads, seq_len, head_size)
 
         # RoPE Implementation
-        m = torch.arange(T, device=x.device) # (seq_len)
+
+        if self.training:
+            m = torch.arange(T, device=x.device) # (seq_len)
+        else:
+            current_token_pos = self.k_cache.shape[2] if hasattr(self, "k_cache") else 0 # during inference it's how many kv_cache we have (T -1) or 0 if it's the first token generated
+            m = torch.tensor([current_token_pos]) # during inference it's only [current_token_pos]
         i = torch.arange(self.head_size//2, device=x.device) # (head_size/2)
 
         theta = torch.pow(self.rope_theta, (-2*i)/self.head_size) # (head_size/2,)
@@ -48,8 +57,8 @@ class MultiHeadAttention(nn.Module):
         q_even = q[:, :, :, ::2] # (B, seq_len, head_size/2)
         q_odd = q[:, :, :, 1::2] # (B, seq_len, head_size/2)
 
-        q_1 = q_even * cos - q_odd * sin # (B, seq_len, head_size/2)
-        q_2 = q_even * sin + q_odd * cos # (B, seq_len, head_size/2)
+        q_1 = q_even * cos - q_odd * sin # (B, seq_len, head_size/2) or (B, 1, head_size/2) during inference
+        q_2 = q_even * sin + q_odd * cos # (B, seq_len, head_size/2) or (B, 1, head_size/2) during inference
         q_rotated = torch.stack([q_1, q_2], dim=-1).reshape(q.shape) # (B, seq_len, head_size)
 
         k_even = k[:, :, :, ::2] # (B, seq_len, head_size/2)
@@ -60,17 +69,26 @@ class MultiHeadAttention(nn.Module):
         k_rotated = torch.stack([k_1, k_2], dim=-1).reshape(k.shape) # (B, seq_len, head_size)
 
         # Flash Attention with causal mask
-        attn_mask = torch.tril(torch.ones(T, T, device=x.device)).bool()
-        k_rotated = k_rotated.repeat_interleave(self.num_heads // self.grouped_kv_heads, dim=1)  # (B, grouped_kv_heads, T, head_size) repeat the [1] dimension to get -> (B, num_heads, T, head_size) so that we can multiply it with v
+        attn_mask = torch.tril(torch.ones(T, T, device=x.device)).bool() if self.training else None # create it during training only
+        k_rotated = k_rotated.repeat_interleave(self.num_heads // self.grouped_kv_heads, dim=1)  # (B, grouped_kv_heads, T, head_size) repeat the [1] dimension to get -> (B, num_heads, T, head_size) so that we can multiply it with q
         v = v.repeat_interleave(self.num_heads // self.grouped_kv_heads, dim=1) 
+
+        if not self.training:
+            if not hasattr(self, "k_cache"):
+                self.k_cache = k_rotated
+                self.v_cache = v
+            else:
+                k_rotated = self.k_cache = torch.cat([self.k_cache, k_rotated], dim=2)
+                v = self.v_cache = torch.cat([self.v_cache, v], dim=2)
         
         x = F.scaled_dot_product_attention(
             q_rotated, k_rotated, v,
             attn_mask=attn_mask,
             dropout_p=self.dropout.p if self.training else 0.0,
             is_causal=False  # we provide explicit mask here
+            enable_gqa=True
         )
-        x = x.transpose(1, 2).contiguous().view(B, T, D)
+        x = x.transpose(1, 2).contiguous().view(B, T if self.training else 1, D)
         x = self.proj(x)
         x = self.dropout(x)
         return x
