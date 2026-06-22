@@ -7,6 +7,7 @@ torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
+io_weight_tying = False
 
 class MultiHeadAttention(nn.Module):
     
@@ -21,7 +22,7 @@ class MultiHeadAttention(nn.Module):
 
         dim2 = head_size * grouped_kv_heads * 2 + embedding_dim
         self.kqv = nn.Linear(embedding_dim, dim2, bias=False) # one projection for all heads and for all k, q, v
-        self.proj = nn.Linear(embedding_dim, embedding_dim)
+        self.proj = nn.Linear(embedding_dim, embedding_dim, bias=False)
         self.dropout = nn.Dropout(dropout_rate)
 
     def forward(self, x):
@@ -45,19 +46,20 @@ class MultiHeadAttention(nn.Module):
         sin = torch.sin(m_theta) # (seq_len, head_size/2)
         cos = torch.cos(m_theta) # (seq_len, head_size/2)
 
-        q_even = q[:, :, :, ::2] # (B, seq_len, head_size/2)
-        q_odd = q[:, :, :, 1::2] # (B, seq_len, head_size/2)
+        q_first_half = q[:, :, :, :self.head_size//2] # (B, seq_len, head_size/2)
+        q_second_half = q[:, :, :, self.head_size//2:] # (B, seq_len, head_size/2)
 
-        q_1 = q_even * cos - q_odd * sin # (B, seq_len, head_size/2)
-        q_2 = q_even * sin + q_odd * cos # (B, seq_len, head_size/2)
-        q_rotated = torch.stack([q_1, q_2], dim=-1).reshape(q.shape) # (B, seq_len, head_size)
+        q_1 = q_first_half * cos - q_second_half * sin # (B, seq_len, head_size/2)
+        q_2 = q_first_half * sin + q_second_half * cos # (B, seq_len, head_size/2)
+        q_rotated = torch.cat([q_1, q_2], dim=-1).reshape(q.shape) # (B, seq_len, head_size)
+        assert q_rotated.shape == q.shape, "Mismatch in the shape of q_rotated and q"
 
-        k_even = k[:, :, :, ::2] # (B, seq_len, head_size/2)
-        k_odd = k[:, :, :, 1::2] # (B, seq_len, head_size/2)
+        k_first_half = k[:, :, :, :self.head_size//2] # (B, seq_len, head_size/2)
+        k_second_half = k[:, :, :, self.head_size//2:] # (B, seq_len, head_size/2)
 
-        k_1 = k_even * cos - k_odd * sin # (B, seq_len, head_size/2)
-        k_2 = k_even * sin + k_odd * cos # (B, seq_len, head_size/2)
-        k_rotated = torch.stack([k_1, k_2], dim=-1).reshape(k.shape) # (B, seq_len, head_size)
+        k_1 = k_first_half * cos - k_second_half * sin # (B, seq_len, head_size/2)
+        k_2 = k_first_half * sin + k_second_half * cos # (B, seq_len, head_size/2)
+        k_rotated = torch.cat([k_1, k_2], dim=-1).reshape(k.shape) # (B, seq_len, head_size)
 
         # Flash Attention with causal mask
         attn_mask = torch.tril(torch.ones(T, T, device=x.device)).bool()
@@ -90,7 +92,7 @@ class FeedForwardNN(nn.Module):
     def forward(self, x):
         x = F.silu(self.W1(x)) * self.W3(x) # element-wise multiply: (B, T, H)
         x = self.dropout(self.W2(x))
-        return 
+        return x
 
 
 
@@ -105,11 +107,11 @@ class DecoderBlock(nn.Module):
 
     def forward(self, x):
 
-        x = self.norm1(x)
-        x = x + self.mha(x) # the skip connection
+        x_norm = self.norm1(x)
+        x = x + self.mha(x_norm) # the skip connection
 
-        x = self.norm2(x)
-        x = x + self.ffnn(x) # the skip connection
+        x_norm = self.norm2(x)
+        x = x + self.ffnn(x_norm) # the skip connection
 
         return x 
 
@@ -120,21 +122,19 @@ class llama(nn.Module):
         head_size = embedding_dim // num_heads
 
         self.embedding_table = nn.Embedding(vocab_size, embedding_dim)
-        self.pos_embedding_table = nn.Embedding(max_seq_len, embedding_dim)
         self.blocks = nn.ModuleList([DecoderBlock(embedding_dim, hidden_dim, num_heads, grouped_kv_heads, head_size, rope_theta, dropout_rate) for _ in range(n_layers)])
         self.norm = nn.RMSNorm(embedding_dim)
         self.classifier_layer = nn.Linear(embedding_dim, vocab_size, bias=False)
         self.dropout = nn.Dropout(dropout_rate)
 
-        self.classifier_layer.weight = self.embedding_table.weight # tying the weights together
+        if io_weight_tying:
+            self.classifier_layer.weight = self.embedding_table.weight # tying the weights together
 
     def forward(self, ids, targets=None):
-        b, seq_len = ids.shape # ids is (batch_size, seq_len)
-
+        
         embeddings = self.embedding_table(ids) # (batch_size, seq_len, embedding_dim)
-        pos_embeddings = self.pos_embedding_table(torch.arange(seq_len, device=device))
 
-        x = embeddings + pos_embeddings # (batch_size, seq_len, embedding_dim)
+        x = embeddings # (batch_size, seq_len, embedding_dim)
         x = self.dropout(x)
 
         for block in self.blocks:

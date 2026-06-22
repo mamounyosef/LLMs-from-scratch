@@ -25,17 +25,17 @@ ARCHITECTURE_CONFIG = {
     'max_seq_len': 1024, # (context window size)
     'vocab_size': 128_000,
     'rope_theta': 500_000,
-    'dropout_rate': 0.1
+    'dropout_rate': 0.0
 }
-TRAIN_CONFIG = {
-    'num_iters': 80,
-    'effective_batch_size_in_tokens': 524288,  # 2**19, ~0.5M number of tokens, which is 524288 // T samples
+TRAIN_CONFIG = { 
+    'num_iters': 120, # was 1_200_000 in the original llama 3 paper
+    'effective_batch_size_in_tokens': 524_288,  # 2**19, ~0.5M number of tokens, which is 524288 // T samples
     'batch_size': 4,
     'gradient_accumulation_steps': None,  # will be set dynamically
 
     'learning_rate': 3e-4,
     'min_lr': None, # will be set dynamically
-    'warmup_steps': 2000,
+    'warmup_steps': 2000, # was 2000 in the original llama 3 paper
 
     'eval_interval': 1,
     'eval_steps': 30, # number of validation steps to run during evaluation
@@ -120,10 +120,6 @@ scheduler = SequentialLR(
     schedulers=[warmup_scheduler, cosine_scheduler],
     milestones=[TRAIN_CONFIG['warmup_steps']],
 )
-
-
-
-
 
 best_loss = float('inf')
 
