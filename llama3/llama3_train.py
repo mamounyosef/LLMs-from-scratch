@@ -1,11 +1,12 @@
 import torch
 torch.set_float32_matmul_precision('high')
 from torch.utils.data import Dataset, DataLoader
-import tiktoken
 import os
 import time
 import csv
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+
+from transformers import AutoTokenizer
 
 from llama3 import llama
 
@@ -22,33 +23,34 @@ ARCHITECTURE_CONFIG = {
     'hidden_dim': 14_336,
     'num_heads': 32,
     'grouped_kv_heads': 8,
-    'max_seq_len': 1024, # (context window size)
+    'max_seq_len': 256, # (context window size), initial first value in the original paper is 4096
     'vocab_size': 128_000,
     'rope_theta': 500_000,
-    'dropout_rate': 0.0
+    'dropout_rate': 0.0,
+    'io_weight_tying': False,
 }
 TRAIN_CONFIG = { 
-    'num_iters': 120, # was 1_200_000 in the original llama 3 paper
-    'effective_batch_size_in_tokens': 524_288,  # 2**19, ~0.5M number of tokens, which is 524288 // T samples
-    'batch_size': 4,
+    'num_gradient_steps': 300, # was 1_200_000 in the original llama 3 paper
+    'effective_batch_size_in_tokens': 8192,
+    'batch_size': 1,
     'gradient_accumulation_steps': None,  # will be set dynamically
 
     'learning_rate': 3e-4,
     'min_lr': None, # will be set dynamically
-    'warmup_steps': 2000, # was 2000 in the original llama 3 paper
+    'warmup_steps': 5, # was 2000 in the original llama 3 paper
 
     'eval_interval': 1,
     'eval_steps': 30, # number of validation steps to run during evaluation
     'checkpoint_interval': 10
 
 }
-TRAIN_CONFIG['gradient_accumulation_steps'] = TRAIN_CONFIG['effective_batch_size_in_tokens'] // (TRAIN_CONFIG['batch_size'] * ARCHITECTURE_CONFIG['seq_len'])
-TRAIN_CONFIG["min_lr"] = TRAIN_CONFIG['learning_rate'] * 0.1
+TRAIN_CONFIG['gradient_accumulation_steps'] = TRAIN_CONFIG['effective_batch_size_in_tokens'] // (TRAIN_CONFIG['batch_size'] * ARCHITECTURE_CONFIG['max_seq_len'])
+TRAIN_CONFIG["min_lr"] = TRAIN_CONFIG['learning_rate'] * 0.01
 
 
 print(f"Effective Total batch size in tokens: {TRAIN_CONFIG['effective_batch_size_in_tokens']}, Batch Size (in steps): {TRAIN_CONFIG['batch_size']}, Gradient Accumulation Steps: {TRAIN_CONFIG['gradient_accumulation_steps']}")
 
-model = llama().to(device) # default parameters
+model = llama(**ARCHITECTURE_CONFIG).to(device) # default parameters
 model = torch.compile(model)
 print(sum(p.numel() for p in model.parameters())/1e6, 'M parameters')
     
@@ -60,8 +62,8 @@ class DataLoaderLite:
         with open(dataset_path, 'r', encoding='utf-8') as f:
             text = f.read()
         
-        enc = tiktoken.get_encoding('')
-        tokens = enc.encode(text)
+        tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B")
+        tokens = tokenizer.encode(text)
         self.data = torch.tensor(tokens, dtype=torch.long)
 
         n = int(0.9 * len(self.data))
@@ -84,12 +86,12 @@ class DataLoaderLite:
         return x, y
     
 
-train_loader = DataLoaderLite(batch_size=batch_size, split='train')
-val_loader = DataLoaderLite(batch_size=batch_size, split='val')
+train_loader = DataLoaderLite(batch_size=batch_size, seq_len=ARCHITECTURE_CONFIG['max_seq_len'], split='train')
+val_loader = DataLoaderLite(batch_size=batch_size, seq_len=ARCHITECTURE_CONFIG['max_seq_len'], split='val')
 
 print(f"Train number of tokens: {len(train_loader.data)}, Val number of tokens: {len(val_loader.data)}")
 num_tokens_in_dataset = len(train_loader.data)
-num_epochs = (TRAIN_CONFIG['num_iters'] * TRAIN_CONFIG['effective_batch_size_in_tokens']) / num_tokens_in_dataset
+num_epochs = (TRAIN_CONFIG['num_gradient_steps'] * TRAIN_CONFIG['effective_batch_size_in_tokens']) / num_tokens_in_dataset
 print(f"Total Epochs (how many times the dataset is seen): {num_epochs:.2f}")
     
 save_dir = r"llama3\checkpoints"
@@ -112,7 +114,7 @@ warmup_scheduler = LinearLR(
 )
 cosine_scheduler = CosineAnnealingLR(
     optimizer,
-    T_max=TRAIN_CONFIG['num_iters'] - TRAIN_CONFIG['warmup_steps'],
+    T_max=TRAIN_CONFIG['num_gradient_steps'] - TRAIN_CONFIG['warmup_steps'],
     eta_min=TRAIN_CONFIG['min_lr'],
 )
 scheduler = SequentialLR(
@@ -128,7 +130,7 @@ total_starting_time = time.time()
 print("Starting training...")
 print("*" * 80)
 
-for iter in range(TRAIN_CONFIG['num_iters']):
+for iter in range(TRAIN_CONFIG['num_gradient_steps']):
 
     optimizer.zero_grad()
     loss_accum = 0.0
@@ -161,7 +163,7 @@ for iter in range(TRAIN_CONFIG['num_iters']):
 
     # validation
     val_loss = 0.0
-    if iter % TRAIN_CONFIG['eval_interval'] == 0 or iter == TRAIN_CONFIG['num_iters'] - 1:
+    if iter % TRAIN_CONFIG['eval_interval'] == 0 or iter == TRAIN_CONFIG['num_gradient_steps'] - 1:
         model.eval()
         val_loss_accum = 0.0
         with torch.no_grad():
@@ -175,7 +177,7 @@ for iter in range(TRAIN_CONFIG['num_iters']):
         model.train()
 
     # checkpointing
-    if iter >= int(TRAIN_CONFIG['num_iters'] * 0.5) and iter % TRAIN_CONFIG['checkpoint_interval'] == 0:
+    if iter >= int(TRAIN_CONFIG['num_gradient_steps'] * 0.5) and iter % TRAIN_CONFIG['checkpoint_interval'] == 0:
         checkpoint_path = os.path.join(save_dir, f"checkpoint_step_{iter}.pt")
         torch.save({
             'iter': iter,

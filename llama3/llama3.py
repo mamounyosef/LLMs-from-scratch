@@ -11,7 +11,7 @@ io_weight_tying = False
 
 class MultiHeadAttention(nn.Module):
     
-    def __init__(self, embedding_dim, num_heads, grouped_kv_heads, head_size, rope_theta, dropout_rate):
+    def __init__(self, embedding_dim, num_heads, grouped_kv_heads, head_size, rope_theta, dropout_rate, max_seq_len):
 
         super().__init__()
         self.embedding_dim = embedding_dim
@@ -19,16 +19,19 @@ class MultiHeadAttention(nn.Module):
         self.grouped_kv_heads = grouped_kv_heads
         self.head_size = head_size
         self.rope_theta = rope_theta
+        self.max_seq_len = max_seq_len
 
         dim2 = head_size * grouped_kv_heads * 2 + embedding_dim
         self.kqv = nn.Linear(embedding_dim, dim2, bias=False) # one projection for all heads and for all k, q, v
         self.proj = nn.Linear(embedding_dim, embedding_dim, bias=False)
         self.dropout = nn.Dropout(dropout_rate)
 
+        self.register_buffer("attn_mask", torch.tril(torch.ones(max_seq_len, max_seq_len)).bool())
+
     def forward(self, x):
 
         B, T, D = x.shape # x (input) of size (batch, seq_len, embedding_dim)
-
+        assert T <= self.max_seq_len, "The input sequence length is too large"
         if not self.training:
             x = x[:, -1, :] # (batch, 1, embedding_dim) during inference
 
@@ -71,7 +74,7 @@ class MultiHeadAttention(nn.Module):
         k_rotated = torch.cat([k_1, k_2], dim=-1).reshape(k.shape) # (B, seq_len, head_size)
 
         # Flash Attention with causal mask
-        attn_mask = torch.tril(torch.ones(T, T, device=x.device)).bool() if self.training else None # create it during training only
+        attn_mask = self.attn_mask[:T, :T] if self.training else None # create it during training only
         k_rotated = k_rotated.repeat_interleave(self.num_heads // self.grouped_kv_heads, dim=1)  # (B, grouped_kv_heads, T, head_size) repeat the [1] dimension to get -> (B, num_heads, T, head_size) so that we can multiply it with q
         v = v.repeat_interleave(self.num_heads // self.grouped_kv_heads, dim=1) 
 
@@ -82,12 +85,17 @@ class MultiHeadAttention(nn.Module):
             else:
                 k_rotated = self.k_cache = torch.cat([self.k_cache, k_rotated], dim=2)
                 v = self.v_cache = torch.cat([self.v_cache, v], dim=2)
+
+            k_rotated = self.k_cache = k_rotated[:, :, -self.max_seq_len:, :]
+            v = self.v_cache = v[:, :, -self.max_seq_len:, :]
+
+            
         
         x = F.scaled_dot_product_attention(
             q_rotated, k_rotated, v,
             attn_mask=attn_mask,
             dropout_p=self.dropout.p if self.training else 0.0,
-            is_causal=False  # we provide explicit mask here
+            is_causal=False,  # we provide explicit mask here
             enable_gqa=True
         )
         x = x.transpose(1, 2).contiguous().view(B, T if self.training else 1, D)
@@ -115,10 +123,10 @@ class FeedForwardNN(nn.Module):
 
 
 class DecoderBlock(nn.Module):
-    def __init__(self, embedding_dim, hidden_dim, num_heads, grouped_kv_heads, head_size, rope_theta, dropout):
+    def __init__(self, embedding_dim, hidden_dim, num_heads, grouped_kv_heads, head_size, rope_theta, dropout, max_seq_len):
 
         super().__init__()
-        self.mha = MultiHeadAttention(embedding_dim, num_heads, grouped_kv_heads, head_size, rope_theta, dropout)
+        self.mha = MultiHeadAttention(embedding_dim, num_heads, grouped_kv_heads, head_size, rope_theta, dropout, max_seq_len)
         self.ffnn = FeedForwardNN(embedding_dim, hidden_dim, dropout)
         self.norm1 = nn.RMSNorm(embedding_dim)      
         self.norm2 = nn.RMSNorm(embedding_dim)    
@@ -134,13 +142,13 @@ class DecoderBlock(nn.Module):
         return x 
 
 class llama(nn.Module):
-    def __init__(self, n_layers=32, embedding_dim=4096, hidden_dim=14_336, num_heads=32, grouped_kv_heads=8, max_seq_len=1024, vocab_size=128_000, rope_theta=500_000, dropout_rate=0.1):
+    def __init__(self, n_layers=32, embedding_dim=4096, hidden_dim=14_336, num_heads=32, grouped_kv_heads=8, max_seq_len=1024, vocab_size=128_000, rope_theta=500_000, dropout_rate=0.1, io_weight_tying=True):
 
         super().__init__()
         head_size = embedding_dim // num_heads
 
         self.embedding_table = nn.Embedding(vocab_size, embedding_dim)
-        self.blocks = nn.ModuleList([DecoderBlock(embedding_dim, hidden_dim, num_heads, grouped_kv_heads, head_size, rope_theta, dropout_rate) for _ in range(n_layers)])
+        self.blocks = nn.ModuleList([DecoderBlock(embedding_dim, hidden_dim, num_heads, grouped_kv_heads, head_size, rope_theta, dropout_rate, max_seq_len) for _ in range(n_layers)])
         self.norm = nn.RMSNorm(embedding_dim)
         self.classifier_layer = nn.Linear(embedding_dim, vocab_size, bias=False)
         self.dropout = nn.Dropout(dropout_rate)
