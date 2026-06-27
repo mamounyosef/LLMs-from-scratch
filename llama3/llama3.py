@@ -49,7 +49,7 @@ class MultiHeadAttention(nn.Module):
             m = torch.arange(T, device=x.device) # (seq_len)
         else:
             current_token_pos = self.k_cache.shape[2] if hasattr(self, "k_cache") else 0 # during inference it's how many kv_cache we have (T -1) or 0 if it's the first token generated
-            m = torch.tensor([current_token_pos]) # during inference it's only [current_token_pos]
+            m = torch.tensor([current_token_pos], device=x.device) # during inference it's only [current_token_pos]
         i = torch.arange(self.head_size//2, device=x.device) # (head_size/2)
 
         theta = torch.pow(self.rope_theta, (-2*i)/self.head_size) # (head_size/2,)
@@ -119,9 +119,6 @@ class FeedForwardNN(nn.Module):
         x = F.silu(self.W1(x)) * self.W3(x) # element-wise multiply: (B, T, H)
         x = self.dropout(self.W2(x))
         return x
-
-
-
 class DecoderBlock(nn.Module):
     def __init__(self, embedding_dim, hidden_dim, num_heads, grouped_kv_heads, head_size, rope_theta, dropout, max_seq_len):
 

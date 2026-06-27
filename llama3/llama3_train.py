@@ -24,7 +24,7 @@ ARCHITECTURE_CONFIG = {
     'num_heads': 32,
     'grouped_kv_heads': 8,
     'max_seq_len': 256, # (context window size), initial first value in the original paper is 4096
-    'vocab_size': 128_000,
+    'vocab_size': 128_256,
     'rope_theta': 500_000,
     'dropout_rate': 0.0,
     'io_weight_tying': False,
@@ -39,7 +39,7 @@ TRAIN_CONFIG = {
     'min_lr': None, # will be set dynamically
     'warmup_steps': 5, # was 2000 in the original llama 3 paper
 
-    'eval_interval': 1,
+    'eval_interval': 8,
     'eval_steps': 30, # number of validation steps to run during evaluation
     'checkpoint_interval': 10
 
@@ -49,164 +49,164 @@ TRAIN_CONFIG["min_lr"] = TRAIN_CONFIG['learning_rate'] * 0.01
 
 
 print(f"Effective Total batch size in tokens: {TRAIN_CONFIG['effective_batch_size_in_tokens']}, Batch Size (in steps): {TRAIN_CONFIG['batch_size']}, Gradient Accumulation Steps: {TRAIN_CONFIG['gradient_accumulation_steps']}")
-
-model = llama(**ARCHITECTURE_CONFIG).to(device) # default parameters
-model = torch.compile(model)
-print(sum(p.numel() for p in model.parameters())/1e6, 'M parameters')
-    
-class DataLoaderLite:
-    def __init__(self, batch_size, seq_len=1024, split='train', dataset_path=r'dataset.txt'):
-        self.batch_size = batch_size
-        self.seq_len = seq_len
-
-        with open(dataset_path, 'r', encoding='utf-8') as f:
-            text = f.read()
+def run_training():
+    model = llama(**ARCHITECTURE_CONFIG).to(device) # default parameters
+    model = torch.compile(model)
+    print(sum(p.numel() for p in model.parameters())/1e6, 'M parameters')
         
-        tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B")
-        tokens = tokenizer.encode(text)
-        self.data = torch.tensor(tokens, dtype=torch.long)
+    class DataLoaderLite:
+        def __init__(self, batch_size, seq_len=1024, split='train', dataset_path='/root/dataset.txt'):
+            self.batch_size = batch_size
+            self.seq_len = seq_len
 
-        n = int(0.9 * len(self.data))
+            with open(dataset_path, 'r', encoding='utf-8') as f:
+                text = f.read()
+            
+            tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B")
+            tokens = tokenizer.encode(text)
+            self.data = torch.tensor(tokens, dtype=torch.long)
 
-        if split == 'train':
-            self.data = self.data[:n]
-        else:
-            self.data = self.data[n:]
+            n = int(0.9 * len(self.data))
+
+            if split == 'train':
+                self.data = self.data[:n]
+            else:
+                self.data = self.data[n:]
+            
+            self.current_position = 0
+
+        def next_batch(self):
+            B, T = self.batch_size, self.seq_len
+
+            # random sampling
+            ix = torch.randint(0, len(self.data) - T - 1, (B,))
+            x = torch.stack([self.data[i:i+T] for i in ix])
+            y = torch.stack([self.data[i+1:i+T+1] for i in ix])
+
+            return x, y
         
-        self.current_position = 0
 
-    def next_batch(self):
-        B, T = self.batch_size, self.seq_len
+    train_loader = DataLoaderLite(batch_size=TRAIN_CONFIG[batch_size], seq_len=ARCHITECTURE_CONFIG['max_seq_len'], split='train')
+    val_loader = DataLoaderLite(batch_size=TRAIN_CONFIG[batch_size], seq_len=ARCHITECTURE_CONFIG['max_seq_len'], split='val')
 
-        # random sampling
-        ix = torch.randint(0, len(self.data) - T - 1, (B,))
-        x = torch.stack([self.data[i:i+T] for i in ix])
-        y = torch.stack([self.data[i+1:i+T+1] for i in ix])
+    print(f"Train number of tokens: {len(train_loader.data)}, Val number of tokens: {len(val_loader.data)}")
+    num_tokens_in_dataset = len(train_loader.data)
+    num_epochs = (TRAIN_CONFIG['num_gradient_steps'] * TRAIN_CONFIG['effective_batch_size_in_tokens']) / num_tokens_in_dataset
+    print(f"Total Epochs (how many times the dataset is seen): {num_epochs:.2f}")
+        
+    save_dir = "/checkpoints"
+    os.makedirs(save_dir, exist_ok=True)
 
-        return x, y
-    
-
-train_loader = DataLoaderLite(batch_size=batch_size, seq_len=ARCHITECTURE_CONFIG['max_seq_len'], split='train')
-val_loader = DataLoaderLite(batch_size=batch_size, seq_len=ARCHITECTURE_CONFIG['max_seq_len'], split='val')
-
-print(f"Train number of tokens: {len(train_loader.data)}, Val number of tokens: {len(val_loader.data)}")
-num_tokens_in_dataset = len(train_loader.data)
-num_epochs = (TRAIN_CONFIG['num_gradient_steps'] * TRAIN_CONFIG['effective_batch_size_in_tokens']) / num_tokens_in_dataset
-print(f"Total Epochs (how many times the dataset is seen): {num_epochs:.2f}")
-    
-save_dir = r"llama3\checkpoints"
-os.makedirs(save_dir, exist_ok=True)
-
-# csv logging
-log_file = os.path.join(save_dir, "training_log.csv")
-csv_header = ["step", "loss", "lr", "norm", "dt_ms", "tok_sec", "val_loss"]
-with open(log_file, 'w', newline='') as f:
-    writer = csv.writer(f)
-    writer.writerow(csv_header)
-
-optimizer = torch.optim.AdamW(model.parameters(), lr=TRAIN_CONFIG['learning_rate'], betas=(0.9, 0.95), eps=1e-5, weight_decay=0.1)
-
-warmup_scheduler = LinearLR(
-    optimizer,
-    start_factor=1e-8,
-    end_factor=1.0,
-    total_iters=TRAIN_CONFIG['warmup_steps'],
-)
-cosine_scheduler = CosineAnnealingLR(
-    optimizer,
-    T_max=TRAIN_CONFIG['num_gradient_steps'] - TRAIN_CONFIG['warmup_steps'],
-    eta_min=TRAIN_CONFIG['min_lr'],
-)
-scheduler = SequentialLR(
-    optimizer,
-    schedulers=[warmup_scheduler, cosine_scheduler],
-    milestones=[TRAIN_CONFIG['warmup_steps']],
-)
-
-best_loss = float('inf')
-
-t0 = time.time()
-total_starting_time = time.time()
-print("Starting training...")
-print("*" * 80)
-
-for iter in range(TRAIN_CONFIG['num_gradient_steps']):
-
-    optimizer.zero_grad()
-    loss_accum = 0.0
-
-    # Actual training
-    model.train()
-    for micro_step in range(TRAIN_CONFIG['gradient_accumulation_steps']):
-        x, y = train_loader.next_batch()
-        x, y = x.to(device), y.to(device)
-
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-            logits, loss = model(x, y)
-
-        loss = loss / TRAIN_CONFIG['gradient_accumulation_steps']
-        loss_accum += loss.detach()
-        loss.backward()
-
-    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # gradient clipping
-
-    optimizer.step()
-    scheduler.step()
-    # timing and stats
-    t1 = time.time()
-    dt = t1 - t0
-    t0 = t1
-
-    tokens_processed = TRAIN_CONFIG['effective_batch_size_in_tokens']
-    tokens_per_sec = tokens_processed / dt
-    current_lr = scheduler.get_last_lr()[0]
-
-    # validation
-    val_loss = 0.0
-    if iter % TRAIN_CONFIG['eval_interval'] == 0 or iter == TRAIN_CONFIG['num_gradient_steps'] - 1:
-        model.eval()
-        val_loss_accum = 0.0
-        with torch.no_grad():
-            for _ in range(TRAIN_CONFIG['eval_steps']):
-                x, y = val_loader.next_batch()
-                x, y = x.to(device), y.to(device)
-                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                    logits, loss = model(x, y)
-                val_loss_accum += loss.detach()
-        val_loss = val_loss_accum / TRAIN_CONFIG['eval_steps']
-        model.train()
-
-    # checkpointing
-    if iter >= int(TRAIN_CONFIG['num_gradient_steps'] * 0.5) and iter % TRAIN_CONFIG['checkpoint_interval'] == 0:
-        checkpoint_path = os.path.join(save_dir, f"checkpoint_step_{iter}.pt")
-        torch.save({
-            'iter': iter,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict(),
-            'loss': loss_accum,
-            'val_loss': val_loss,
-        }, checkpoint_path)
-
-    # save best model based on training loss
-    if loss_accum < best_loss:
-        best_loss = loss_accum
-        best_model_path = os.path.join(save_dir, "best_model.pt")
-        torch.save({
-            'iter': iter,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict(),
-            'loss': best_loss,
-        }, best_model_path)
-
-    print(f"step {iter:4d} | loss: {loss_accum:.4f} | lr: {current_lr:.6e} | norm: {grad_norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.0f} | val_loss: {val_loss:.4f}", flush=True)
-
-    # log to csv
-    with open(log_file, 'a', newline='') as f:
+    # csv logging
+    log_file = os.path.join(save_dir, "training_log.csv")
+    csv_header = ["step", "loss", "lr", "norm", "dt_ms", "tok_sec", "val_loss"]
+    with open(log_file, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow([iter, float(loss_accum), current_lr, float(grad_norm), dt*1000, tokens_per_sec, float(val_loss)])
+        writer.writerow(csv_header)
 
-total_time = time.time() - total_starting_time
-print("*" * 80)
-print(f"\nTraining complete! Total time: {total_time / 60:.2f} min")
+    optimizer = torch.optim.AdamW(model.parameters(), lr=TRAIN_CONFIG['learning_rate'], betas=(0.9, 0.95), eps=1e-5, weight_decay=0.1)
+
+    warmup_scheduler = LinearLR(
+        optimizer,
+        start_factor=1e-8,
+        end_factor=1.0,
+        total_iters=TRAIN_CONFIG['warmup_steps'],
+    )
+    cosine_scheduler = CosineAnnealingLR(
+        optimizer,
+        T_max=TRAIN_CONFIG['num_gradient_steps'] - TRAIN_CONFIG['warmup_steps'],
+        eta_min=TRAIN_CONFIG['min_lr'],
+    )
+    scheduler = SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[TRAIN_CONFIG['warmup_steps']],
+    )
+
+    best_loss = float('inf')
+
+    t0 = time.time()
+    total_starting_time = time.time()
+    print("Starting training...")
+    print("*" * 80)
+
+    for iter in range(TRAIN_CONFIG['num_gradient_steps']):
+
+        optimizer.zero_grad()
+        loss_accum = 0.0
+
+        # Actual training
+        model.train()
+        for micro_step in range(TRAIN_CONFIG['gradient_accumulation_steps']):
+            x, y = train_loader.next_batch()
+            x, y = x.to(device), y.to(device)
+
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                logits, loss = model(x, y)
+
+            loss = loss / TRAIN_CONFIG['gradient_accumulation_steps']
+            loss_accum += loss.detach()
+            loss.backward()
+
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # gradient clipping
+
+        optimizer.step()
+        scheduler.step()
+        # timing and stats
+        t1 = time.time()
+        dt = t1 - t0
+        t0 = t1
+
+        tokens_processed = TRAIN_CONFIG['effective_batch_size_in_tokens']
+        tokens_per_sec = tokens_processed / dt
+        current_lr = scheduler.get_last_lr()[0]
+
+        # validation
+        val_loss = 0.0
+        if iter % TRAIN_CONFIG['eval_interval'] == 0 or iter == TRAIN_CONFIG['num_gradient_steps'] - 1:
+            model.eval()
+            val_loss_accum = 0.0
+            with torch.no_grad():
+                for _ in range(TRAIN_CONFIG['eval_steps']):
+                    x, y = val_loader.next_batch()
+                    x, y = x.to(device), y.to(device)
+                    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                        logits, loss = model(x, y)
+                    val_loss_accum += loss.detach()
+            val_loss = val_loss_accum / TRAIN_CONFIG['eval_steps']
+            model.train()
+
+        # checkpointing
+        if iter >= int(TRAIN_CONFIG['num_gradient_steps'] * 0.5) and iter % TRAIN_CONFIG['checkpoint_interval'] == 0:
+            checkpoint_path = os.path.join(save_dir, f"checkpoint_step_{iter}.pt")
+            torch.save({
+                'iter': iter,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'loss': loss_accum,
+                'val_loss': val_loss,
+            }, checkpoint_path)
+
+        # save best model based on training loss
+        if loss_accum < best_loss:
+            best_loss = loss_accum
+            best_model_path = os.path.join(save_dir, "best_model.pt")
+            torch.save({
+                'iter': iter,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'loss': best_loss,
+            }, best_model_path)
+
+        print(f"step {iter:4d} | loss: {loss_accum:.4f} | lr: {current_lr:.6e} | norm: {grad_norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.0f} | val_loss: {val_loss:.4f}", flush=True)
+
+        # log to csv
+        with open(log_file, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([iter, float(loss_accum), current_lr, float(grad_norm), dt*1000, tokens_per_sec, float(val_loss)])
+
+    total_time = time.time() - total_starting_time
+    print("*" * 80)
+    print(f"\nTraining complete! Total time: {total_time / 60:.2f} min")
