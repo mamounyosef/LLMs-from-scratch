@@ -10,6 +10,8 @@ from transformers import AutoTokenizer
 
 from llama3 import llama
 
+TRAIN_ON_MODAL = True
+
 SEED = 42
 torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
@@ -23,7 +25,7 @@ ARCHITECTURE_CONFIG = {
     'hidden_dim': 14_336,
     'num_heads': 32,
     'grouped_kv_heads': 8,
-    'max_seq_len': 256, # (context window size), initial first value in the original paper is 4096
+    'max_seq_len': 512, # (context window size), initial first value in the original paper is 4096
     'vocab_size': 128_256,
     'rope_theta': 500_000,
     'dropout_rate': 0.0,
@@ -32,14 +34,14 @@ ARCHITECTURE_CONFIG = {
 TRAIN_CONFIG = { 
     'num_gradient_steps': 300, # was 1_200_000 in the original llama 3 paper
     'effective_batch_size_in_tokens': 8192,
-    'batch_size': 1,
+    'batch_size': 16,
     'gradient_accumulation_steps': None,  # will be set dynamically
 
     'learning_rate': 3e-4,
     'min_lr': None, # will be set dynamically
     'warmup_steps': 5, # was 2000 in the original llama 3 paper
 
-    'eval_interval': 8,
+    'eval_interval': 10,
     'eval_steps': 30, # number of validation steps to run during evaluation
     'checkpoint_interval': 10
 
@@ -49,6 +51,7 @@ TRAIN_CONFIG["min_lr"] = TRAIN_CONFIG['learning_rate'] * 0.01
 
 
 print(f"Effective Total batch size in tokens: {TRAIN_CONFIG['effective_batch_size_in_tokens']}, Batch Size (in steps): {TRAIN_CONFIG['batch_size']}, Gradient Accumulation Steps: {TRAIN_CONFIG['gradient_accumulation_steps']}")
+
 def run_training():
     model = llama(**ARCHITECTURE_CONFIG).to(device) # default parameters
     model = torch.compile(model)
@@ -64,7 +67,7 @@ def run_training():
             
             tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B")
             tokens = tokenizer.encode(text)
-            self.data = torch.tensor(tokens, dtype=torch.long)
+            self.data = torch.tensor(tokens, dtype=torch.long).to(device) # because the dataset is small enough, it can just live on the GPU (remove it for a big dataset)
 
             n = int(0.9 * len(self.data))
 
@@ -86,8 +89,8 @@ def run_training():
             return x, y
         
 
-    train_loader = DataLoaderLite(batch_size=TRAIN_CONFIG[batch_size], seq_len=ARCHITECTURE_CONFIG['max_seq_len'], split='train')
-    val_loader = DataLoaderLite(batch_size=TRAIN_CONFIG[batch_size], seq_len=ARCHITECTURE_CONFIG['max_seq_len'], split='val')
+    train_loader = DataLoaderLite(batch_size=TRAIN_CONFIG['batch_size'], seq_len=ARCHITECTURE_CONFIG['max_seq_len'], split='train')
+    val_loader = DataLoaderLite(batch_size=TRAIN_CONFIG['batch_size'], seq_len=ARCHITECTURE_CONFIG['max_seq_len'], split='val')
 
     print(f"Train number of tokens: {len(train_loader.data)}, Val number of tokens: {len(val_loader.data)}")
     num_tokens_in_dataset = len(train_loader.data)
@@ -122,8 +125,6 @@ def run_training():
         schedulers=[warmup_scheduler, cosine_scheduler],
         milestones=[TRAIN_CONFIG['warmup_steps']],
     )
-
-    best_loss = float('inf')
 
     t0 = time.time()
     total_starting_time = time.time()
@@ -187,18 +188,10 @@ def run_training():
                 'loss': loss_accum,
                 'val_loss': val_loss,
             }, checkpoint_path)
-
-        # save best model based on training loss
-        if loss_accum < best_loss:
-            best_loss = loss_accum
-            best_model_path = os.path.join(save_dir, "best_model.pt")
-            torch.save({
-                'iter': iter,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'loss': best_loss,
-            }, best_model_path)
+            
+            if TRAIN_ON_MODAL == True:
+                import modal 
+                modal.Volume.from_name("llama3-checkpoints").commit()
 
         print(f"step {iter:4d} | loss: {loss_accum:.4f} | lr: {current_lr:.6e} | norm: {grad_norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.0f} | val_loss: {val_loss:.4f}", flush=True)
 
@@ -210,3 +203,6 @@ def run_training():
     total_time = time.time() - total_starting_time
     print("*" * 80)
     print(f"\nTraining complete! Total time: {total_time / 60:.2f} min")
+
+if TRAIN_ON_MODAL == False:
+    run_training()
