@@ -28,25 +28,26 @@ class MultiHeadAttention(nn.Module):
 
         self.register_buffer("attn_mask", torch.tril(torch.ones(max_seq_len, max_seq_len)).bool())
 
-    def forward(self, x):
+    def forward(self, x, is_inference=False, is_prefill=False):
+        
 
         B, T, D = x.shape # x (input) of size (batch, seq_len, embedding_dim)
         assert T <= self.max_seq_len, "The input sequence length is too large"
-        if not self.training:
-            x = x[:, -1, :] # (batch, 1, embedding_dim) during inference
 
         k_v, q = self.kqv(x).split([self.head_size * self.grouped_kv_heads * 2, self.embedding_dim], dim=-1) # split into k_v and q first
         k, v = k_v.split(self.head_size * self.grouped_kv_heads, dim=-1) # then split into k and v
 
-        second_dim = T if self.training else 1 # during inference the 2nd indexed dimention is 1 instead of seq_len for each k and q and v
+        second_dim = T if self.training or is_prefill else 1 # during inference the 2nd indexed dimention is 1 instead of seq_len for each k and q and v unless it's the pre-filling stage of inference then it's seq len of the new prompt
         k = k.view(B, second_dim, self.grouped_kv_heads, self.head_size).transpose(1, 2) # finally its (B, grouped_kv_heads, seq_len, head_size)
         q = q.view(B, second_dim, self.num_heads, self.head_size).transpose(1, 2) # (B, num_heads, seq_len, head_size)
         v = v.view(B, second_dim, self.grouped_kv_heads, self.head_size).transpose(1, 2) # (B, grouped_kv_heads, seq_len, head_size)
 
         # RoPE Implementation
 
-        if self.training:
+        if not is_inference:
             m = torch.arange(T, device=x.device) # (seq_len)
+        elif is_prefill:
+            m = torch.arange(T, device=x.device) # (new_input_prompt) during pre-fill inference 
         else:
             current_token_pos = self.k_cache.shape[2] if hasattr(self, "k_cache") else 0 # during inference it's how many kv_cache we have (T -1) or 0 if it's the first token generated
             m = torch.tensor([current_token_pos], device=x.device) # during inference it's only [current_token_pos]
@@ -74,11 +75,11 @@ class MultiHeadAttention(nn.Module):
         k_rotated = torch.cat([k_1, k_2], dim=-1).reshape(k.shape) # (B, seq_len, head_size)
 
         # Flash Attention with causal mask
-        attn_mask = self.attn_mask[:T, :T] if self.training else None # create it during training only
+        attn_mask = self.attn_mask[:T, :T] if self.training or is_prefill else None # create it during training only
         k_rotated = k_rotated.repeat_interleave(self.num_heads // self.grouped_kv_heads, dim=1)  # (B, grouped_kv_heads, T, head_size) repeat the [1] dimension to get -> (B, num_heads, T, head_size) so that we can multiply it with q
-        v = v.repeat_interleave(self.num_heads // self.grouped_kv_heads, dim=1) 
+        v = v.repeat_interleave(self.num_heads // self.grouped_kv_heads, dim=1) # same thing but for v
 
-        if not self.training:
+        if is_inference:
             if not hasattr(self, "k_cache"):
                 self.k_cache = k_rotated
                 self.v_cache = v
@@ -98,7 +99,7 @@ class MultiHeadAttention(nn.Module):
             is_causal=False,  # we provide explicit mask here
             enable_gqa=True
         )
-        x = x.transpose(1, 2).contiguous().view(B, T if self.training else 1, D)
+        x = x.transpose(1, 2).contiguous().view(B, T if self.training or is_prefill else 1, D)
         x = self.proj(x)
         x = self.dropout(x)
         return x
@@ -128,10 +129,10 @@ class DecoderBlock(nn.Module):
         self.norm1 = nn.RMSNorm(embedding_dim)      
         self.norm2 = nn.RMSNorm(embedding_dim)    
 
-    def forward(self, x):
+    def forward(self, x, is_inference=False, is_prefill=False):
 
         x_norm = self.norm1(x)
-        x = x + self.mha(x_norm) # the skip connection
+        x = x + self.mha(x_norm, is_inference=is_inference, is_prefill=is_prefill) # the skip connection
 
         x_norm = self.norm2(x)
         x = x + self.ffnn(x_norm) # the skip connection
@@ -150,18 +151,20 @@ class llama(nn.Module):
         self.classifier_layer = nn.Linear(embedding_dim, vocab_size, bias=False)
         self.dropout = nn.Dropout(dropout_rate)
 
+
         if io_weight_tying:
             self.classifier_layer.weight = self.embedding_table.weight # tying the weights together
 
-    def forward(self, ids, targets=None):
+    def forward(self, ids, targets=None, is_inference=False, is_prefill=False):
         
+        assert len(ids.shape) == 2
         embeddings = self.embedding_table(ids) # (batch_size, seq_len, embedding_dim)
 
         x = embeddings # (batch_size, seq_len, embedding_dim)
         x = self.dropout(x)
 
         for block in self.blocks:
-            x = block(x)
+            x = block(x, is_inference=is_inference, is_prefill=is_prefill)
         
         x = self.norm(x)
         logits = self.classifier_layer(x)
