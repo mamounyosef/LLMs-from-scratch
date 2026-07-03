@@ -22,13 +22,14 @@ def run_generate():
     max_seq_len = 512
 
     print(f"Running {'on Modal' if RUN_ON_MODAL else 'Locally'}")
-    checkpoint_path = "/checkpoints/best_model.pt" if RUN_ON_MODAL else "llama3/checkpoints/best_model.pt"
+    checkpoint_path = "/checkpoints/checkpoint_step_290.pt" if RUN_ON_MODAL else "llama3/checkpoints/checkpoint_step_290.pt"
     output_path = "/checkpoints/generated_sample.txt" if RUN_ON_MODAL else "llama3/generated_sample.txt"
+
+
     print(f"Loading model from {checkpoint_path}")
-
-
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    model = llama().to(device)
+    print("Loaded successfully")
+    model = llama(vocab_size=128_256, max_seq_len=max_seq_len).to(device)
 
     state_dict = checkpoint['model_state_dict']
     state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
@@ -36,13 +37,13 @@ def run_generate():
     model.eval()
 
     enc = AutoTokenizer.from_pretrained('meta-llama/Meta-Llama-3-8B')
-
+    print("Loaded the tokenizer")
     prompt = "When do you think we will have AGI?"
     prefill = True
 
-    max_new_tokens = 100
+    max_new_tokens = 150
     temperature = 0.3
-    top_k = 10
+    top_k = 100
 
     print(f"Prompt: {prompt}")
 
@@ -57,12 +58,12 @@ def run_generate():
                 logits, _ = model(tokens_tensor, is_inference=True, is_prefill=True)
                 prefill = False
             else:
-                logits, _ = model(torch.tensor([[next_token]]), is_inference=True)
+                logits, _ = model(torch.tensor([[next_token]], device=device), is_inference=True)
 
             logits = logits[0, -1, :]
             logits = logits / temperature
 
-            penalty = 1.2  # >1 discourages repetition
+            penalty = 1.4  # >1 discourages repetition
             for token_id in set(generated_tokens[-50:]):  # look at last 50 tokens
                 logits[token_id] /= penalty
 
