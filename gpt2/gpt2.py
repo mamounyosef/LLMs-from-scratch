@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import math
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -27,13 +28,21 @@ class Head(nn.Module):
         q = self.query(x) # (B, seq_len, head_size)
         v = self.value(x) # (B, seq_len, head_size)
 
-        attn_mask = torch.tril(torch.ones(seq_len, seq_len, device=x.device)).bool()
-        out = F.scaled_dot_product_attention( # Flash Attention
-            q, k, v,
-            attn_mask=attn_mask,
-            dropout_p=self.dropout.p if self.training else 0.0,
-            is_causal=False  # we provide explicit mask
-        )
+        attn_mask = torch.tril(torch.ones(seq_len, seq_len, device=x.device)).bool() # .tril makes a lower triangle and zeros out the above
+        scores = (q @ k.transpose(-1, -2)) / math.sqrt(self.head_size)    #  (B, seq_len, head_size) @ (B, head_size, seq_len) -> (B, seq_len, seq_len)
+
+        masked_scores = scores.masked_fill(attn_mask == 0, float("-inf"))
+        scores_softmax = torch.softmax(masked_scores, dim=-1) # (B, seq_len, seq_len(softmaxed)) meaning propabilities
+        scores_softmax = self.dropout(scores_softmax)
+
+        out = scores_softmax @ v
+
+        # out = F.scaled_dot_product_attention( # Flash Attention (more efficient)
+        #     q, k, v,
+        #     attn_mask=attn_mask,
+        #     dropout_p=self.dropout.p if self.training else 0.0,
+        #     is_causal=False  # we provide explicit mask
+        # )
 
         return out
 
